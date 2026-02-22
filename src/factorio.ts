@@ -304,6 +304,13 @@ const DISPLAY_NAMES: Record<string, string> = {
   "electronic-circuit": "Green Circuits",
   "advanced-circuit": "Red Circuits",
   "processing-unit": "Blue Circuits",
+  "automation-science-pack": "Red Science",
+  "logistic-science-pack": "Green Science",
+  "military-science-pack": "Military Science",
+  "chemical-science-pack": "Blue Science",
+  "production-science-pack": "Purple Science",
+  "utility-science-pack": "Yellow Science",
+  "space-science-pack": "Space Science",
 };
 
 /**
