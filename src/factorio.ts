@@ -4,9 +4,10 @@
  * Provides high-level methods to query Factorio server stats via RCON:
  * - Evolution factor, rockets launched, map age
  * - Online players, server version, map seed
+ * - Production rates, pollution, research (via remlab-bridge mod)
  *
- * Uses `/sc rcon.print(...)` for Lua queries (silent command — avoids
- * achievements-disabled warning and console spam).
+ * Uses native RCON commands + the remlab-bridge mod for Lua queries.
+ * The mod avoids /sc console commands, preserving achievements.
  *
  * @remlab/game-rcon — Part of Game Server Ecosystem (#406), Issue #489
  */
@@ -22,6 +23,17 @@ import type {
 
 const DEFAULT_CACHE_TTL = 45_000; // 45 seconds
 
+/**
+ * Parsed result from /remlab-stats mod command.
+ * Contains rockets, production, pollution, and research data.
+ */
+interface ModStatsResult {
+  rockets: number | null;
+  production: FactorioProductionRate[];
+  pollution: number | null;
+  research: FactorioResearchStatus;
+}
+
 export class FactorioRcon {
   private readonly client: GameRconClient;
   private readonly cacheTtlMs: number;
@@ -35,8 +47,9 @@ export class FactorioRcon {
   /**
    * Query all Factorio server stats via RCON.
    *
-   * Fires 6 RCON queries in parallel. Individual failures are handled
-   * gracefully — if one query fails, others still return data.
+   * Fires 6 RCON queries in parallel:
+   * - 5 native commands (evolution, time, seed, version, players)
+   * - 1 mod command (/remlab-stats) for rockets + extended data
    *
    * Results are cached for `cacheTtlMs` (default 45s) to prevent
    * hammering the game server.
@@ -64,23 +77,24 @@ export class FactorioRcon {
     if (!connected) return unavailable;
 
     // Fire all queries in parallel — one failure doesn't block others
-    const [evoRes, timeRes, seedRes, versionRes, playersRes, rocketsRes] =
+    // All commands are achievement-safe (native RCON + mod command)
+    const [evoRes, timeRes, seedRes, versionRes, playersRes, modRes] =
       await Promise.allSettled([
         this.client.send("/evolution"),
         this.client.send("/time"),
         this.client.send("/seed"),
         this.client.send("/version"),
         this.client.send("/players online"),
-        this.client.send(
-          "/sc rcon.print(game.forces['player'].rockets_launched)"
-        ),
+        this.client.send("/remlab-stats"),
       ]);
+
+    const modStats = parseModStats(settled(modRes));
 
     const stats: FactorioStats = {
       evolution: parseEvolution(settled(evoRes)),
       mapAgeTicks: parseMapTime(settled(timeRes)),
       mapAgeFormatted: formatMapTime(parseMapTime(settled(timeRes))),
-      rocketsLaunched: parseNumber(settled(rocketsRes)),
+      rocketsLaunched: modStats.rockets,
       seed: settled(seedRes)?.trim() || null,
       version: parseVersion(settled(versionRes)),
       onlinePlayers: parsePlayers(settled(playersRes)),
@@ -103,28 +117,11 @@ export class FactorioRcon {
     this.cache = null;
   }
 
-  /** Items to track production rates for. */
-  private static readonly TRACKED_ITEMS: ReadonlyArray<{
-    item: string;
-    displayName: string;
-  }> = [
-    { item: "iron-plate", displayName: "Iron Plates" },
-    { item: "copper-plate", displayName: "Copper Plates" },
-    { item: "steel-plate", displayName: "Steel Plates" },
-    { item: "electronic-circuit", displayName: "Green Circuits" },
-    { item: "advanced-circuit", displayName: "Red Circuits" },
-    { item: "processing-unit", displayName: "Blue Circuits" },
-  ];
-
   /**
    * Query extended Factorio stats via RCON.
    *
-   * Fires additional Lua queries for production rates, pollution,
-   * and research on top of the basic stats.
-   *
-   * Production data uses `get_flow_count` with
-   * `defines.flow_precision_index.ten_minutes` (items/s averaged
-   * over the last 10 game-minutes).
+   * Fires native RCON commands for basic stats + /remlab-stats mod command
+   * for production rates, pollution, and research. All achievement-safe.
    */
   async getExtendedStats(): Promise<FactorioExtendedStats> {
     const basic = await this.getStats();
@@ -139,29 +136,32 @@ export class FactorioRcon {
       };
     }
 
-    // Single Lua script that queries all tracked items and returns pipe-delimited output
-    const itemList = FactorioRcon.TRACKED_ITEMS.map(
-      (i) => `"${i.item}"`
-    ).join(",");
-    const productionLua = `/sc local items={${itemList}} local f=game.forces["player"] local r={} for _,item in ipairs(items) do local p=f.item_production_statistics.get_flow_count{name=item,input=true,precision_index=defines.flow_precision_index.ten_minutes,count=false} local c=f.item_production_statistics.get_flow_count{name=item,input=false,precision_index=defines.flow_precision_index.ten_minutes,count=false} table.insert(r,item..":"..string.format("%.4f",p)..":"..string.format("%.4f",c)) end rcon.print(table.concat(r,"|"))`;
+    // /remlab-stats was already called during getStats() but isn't cached
+    // separately. Call it again — it's a single fast RCON command.
+    const connected = await this.client.connect();
+    if (!connected) {
+      return {
+        basic,
+        production: [],
+        pollution: null,
+        research: { name: null, progress: null },
+        queriedAt: basic.queriedAt,
+      };
+    }
 
-    const pollutionLua =
-      '/sc rcon.print(string.format("%.2f", game.surfaces[1].get_total_pollution()))';
-
-    const researchLua =
-      '/sc local t=game.forces["player"].current_research if t then rcon.print(t.name..":"..string.format("%.4f",game.forces["player"].research_progress)) else rcon.print("none") end';
-
-    const [prodRes, pollRes, resRes] = await Promise.allSettled([
-      this.client.send(productionLua),
-      this.client.send(pollutionLua),
-      this.client.send(researchLua),
-    ]);
+    let modStats: ModStatsResult;
+    try {
+      const response = await this.client.send("/remlab-stats");
+      modStats = parseModStats(response);
+    } catch {
+      modStats = { rockets: null, production: [], pollution: null, research: { name: null, progress: null } };
+    }
 
     return {
       basic,
-      production: parseProductionRates(settled(prodRes)),
-      pollution: parseFloat(settled(pollRes) ?? "") || null,
-      research: parseResearch(settled(resRes)),
+      production: modStats.production,
+      pollution: modStats.pollution,
+      research: modStats.research,
       queriedAt: new Date().toISOString(),
     };
   }
@@ -256,15 +256,6 @@ function formatMapTime(ticks: number | null): string | null {
   return `${minutes}m`;
 }
 
-/** Parse a simple numeric response (e.g. rockets launched). */
-function parseNumber(response: string | null): number | null {
-  if (!response) return null;
-  const match = response.match(/(\d+)/);
-  if (!match) return null;
-  const value = parseInt(match[1], 10);
-  return isNaN(value) ? null : value;
-}
-
 /**
  * Parse version string from RCON response.
  * Response format: "Version: 2.0.28 (build 72928, linux64, headless)"
@@ -304,7 +295,7 @@ function parsePlayers(response: string | null): string[] {
   return players;
 }
 
-// ─── Extended Stats Parsers ─────────────────────────────────
+// ─── Mod Stats Parser ────────────────────────────────────────
 
 const DISPLAY_NAMES: Record<string, string> = {
   "iron-plate": "Iron Plates",
@@ -316,40 +307,57 @@ const DISPLAY_NAMES: Record<string, string> = {
 };
 
 /**
- * Parse production rates from Lua output.
- * Format: "iron-plate:1.2300:0.4500|copper-plate:2.3400:1.5600"
+ * Parse /remlab-stats mod command response.
+ *
+ * Format: "rockets:<n>|production:<item>:<p>:<c>,...|pollution:<n>|research:<name>:<progress>"
+ * Each section is pipe-delimited at the top level.
  */
-function parseProductionRates(
-  response: string | null
-): FactorioProductionRate[] {
-  if (!response) return [];
-
-  return response
-    .split("|")
-    .map((segment) => {
-      const [item, producedStr, consumedStr] = segment.split(":");
-      if (!item) return null;
-      return {
-        item,
-        displayName: DISPLAY_NAMES[item] ?? item,
-        produced: parseFloat(producedStr) || 0,
-        consumed: parseFloat(consumedStr) || 0,
-      };
-    })
-    .filter((r): r is FactorioProductionRate => r !== null);
-}
-
-/**
- * Parse research status from Lua output.
- * Format: "automation-2:0.4523" or "none"
- */
-function parseResearch(response: string | null): FactorioResearchStatus {
-  if (!response || response.trim() === "none") {
-    return { name: null, progress: null };
-  }
-  const parts = response.trim().split(":");
-  return {
-    name: parts[0] ?? null,
-    progress: parts[1] ? parseFloat(parts[1]) : null,
+function parseModStats(response: string | null): ModStatsResult {
+  const empty: ModStatsResult = {
+    rockets: null,
+    production: [],
+    pollution: null,
+    research: { name: null, progress: null },
   };
+
+  if (!response || response.trim() === "") return empty;
+
+  const sections = response.trim().split("|");
+  const result: ModStatsResult = { ...empty };
+
+  for (const section of sections) {
+    if (section.startsWith("rockets:")) {
+      const val = parseInt(section.slice("rockets:".length), 10);
+      result.rockets = isNaN(val) ? null : val;
+    } else if (section.startsWith("production:")) {
+      const prodData = section.slice("production:".length);
+      if (prodData) {
+        result.production = prodData.split(",").map((entry) => {
+          const [item, producedStr, consumedStr] = entry.split(":");
+          return {
+            item: item || "",
+            displayName: DISPLAY_NAMES[item] ?? item,
+            produced: parseFloat(producedStr) || 0,
+            consumed: parseFloat(consumedStr) || 0,
+          };
+        }).filter((p) => p.item !== "");
+      }
+    } else if (section.startsWith("pollution:")) {
+      const val = parseFloat(section.slice("pollution:".length));
+      result.pollution = isNaN(val) ? null : val;
+    } else if (section.startsWith("research:")) {
+      const resData = section.slice("research:".length);
+      if (resData === "none") {
+        result.research = { name: null, progress: null };
+      } else {
+        const parts = resData.split(":");
+        result.research = {
+          name: parts[0] ?? null,
+          progress: parts[1] ? parseFloat(parts[1]) : null,
+        };
+      }
+    }
+  }
+
+  return result;
 }
