@@ -13,4 +13,7 @@ export type {
   RconConnectionOptions,
   FactorioRconOptions,
   FactorioStats,
+  FactorioExtendedStats,
+  FactorioProductionRate,
+  FactorioResearchStatus,
 } from "./types";

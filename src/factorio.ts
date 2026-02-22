@@ -12,7 +12,13 @@
  */
 
 import { GameRconClient } from "./rcon-client";
-import type { FactorioRconOptions, FactorioStats } from "./types";
+import type {
+  FactorioRconOptions,
+  FactorioStats,
+  FactorioExtendedStats,
+  FactorioProductionRate,
+  FactorioResearchStatus,
+} from "./types";
 
 const DEFAULT_CACHE_TTL = 45_000; // 45 seconds
 
@@ -95,6 +101,69 @@ export class FactorioRcon {
   /** Invalidate the stats cache (force fresh query on next getStats call). */
   clearCache(): void {
     this.cache = null;
+  }
+
+  /** Items to track production rates for. */
+  private static readonly TRACKED_ITEMS: ReadonlyArray<{
+    item: string;
+    displayName: string;
+  }> = [
+    { item: "iron-plate", displayName: "Iron Plates" },
+    { item: "copper-plate", displayName: "Copper Plates" },
+    { item: "steel-plate", displayName: "Steel Plates" },
+    { item: "electronic-circuit", displayName: "Green Circuits" },
+    { item: "advanced-circuit", displayName: "Red Circuits" },
+    { item: "processing-unit", displayName: "Blue Circuits" },
+  ];
+
+  /**
+   * Query extended Factorio stats via RCON.
+   *
+   * Fires additional Lua queries for production rates, pollution,
+   * and research on top of the basic stats.
+   *
+   * Production data uses `get_flow_count` with
+   * `defines.flow_precision_index.ten_minutes` (items/s averaged
+   * over the last 10 game-minutes).
+   */
+  async getExtendedStats(): Promise<FactorioExtendedStats> {
+    const basic = await this.getStats();
+
+    if (!basic.rconAvailable) {
+      return {
+        basic,
+        production: [],
+        pollution: null,
+        research: { name: null, progress: null },
+        queriedAt: basic.queriedAt,
+      };
+    }
+
+    // Single Lua script that queries all tracked items and returns pipe-delimited output
+    const itemList = FactorioRcon.TRACKED_ITEMS.map(
+      (i) => `"${i.item}"`
+    ).join(",");
+    const productionLua = `/sc local items={${itemList}} local f=game.forces["player"] local r={} for _,item in ipairs(items) do local p=f.item_production_statistics.get_flow_count{name=item,input=true,precision_index=defines.flow_precision_index.ten_minutes,count=false} local c=f.item_production_statistics.get_flow_count{name=item,input=false,precision_index=defines.flow_precision_index.ten_minutes,count=false} table.insert(r,item..":"..string.format("%.4f",p)..":"..string.format("%.4f",c)) end rcon.print(table.concat(r,"|"))`;
+
+    const pollutionLua =
+      '/sc rcon.print(string.format("%.2f", game.surfaces[1].get_total_pollution()))';
+
+    const researchLua =
+      '/sc local t=game.forces["player"].current_research if t then rcon.print(t.name..":"..string.format("%.4f",game.forces["player"].research_progress)) else rcon.print("none") end';
+
+    const [prodRes, pollRes, resRes] = await Promise.allSettled([
+      this.client.send(productionLua),
+      this.client.send(pollutionLua),
+      this.client.send(researchLua),
+    ]);
+
+    return {
+      basic,
+      production: parseProductionRates(settled(prodRes)),
+      pollution: parseFloat(settled(pollRes) ?? "") || null,
+      research: parseResearch(settled(resRes)),
+      queriedAt: new Date().toISOString(),
+    };
   }
 
   /** Disconnect from RCON. */
@@ -233,4 +302,54 @@ function parsePlayers(response: string | null): string[] {
   }
 
   return players;
+}
+
+// ─── Extended Stats Parsers ─────────────────────────────────
+
+const DISPLAY_NAMES: Record<string, string> = {
+  "iron-plate": "Iron Plates",
+  "copper-plate": "Copper Plates",
+  "steel-plate": "Steel Plates",
+  "electronic-circuit": "Green Circuits",
+  "advanced-circuit": "Red Circuits",
+  "processing-unit": "Blue Circuits",
+};
+
+/**
+ * Parse production rates from Lua output.
+ * Format: "iron-plate:1.2300:0.4500|copper-plate:2.3400:1.5600"
+ */
+function parseProductionRates(
+  response: string | null
+): FactorioProductionRate[] {
+  if (!response) return [];
+
+  return response
+    .split("|")
+    .map((segment) => {
+      const [item, producedStr, consumedStr] = segment.split(":");
+      if (!item) return null;
+      return {
+        item,
+        displayName: DISPLAY_NAMES[item] ?? item,
+        produced: parseFloat(producedStr) || 0,
+        consumed: parseFloat(consumedStr) || 0,
+      };
+    })
+    .filter((r): r is FactorioProductionRate => r !== null);
+}
+
+/**
+ * Parse research status from Lua output.
+ * Format: "automation-2:0.4523" or "none"
+ */
+function parseResearch(response: string | null): FactorioResearchStatus {
+  if (!response || response.trim() === "none") {
+    return { name: null, progress: null };
+  }
+  const parts = response.trim().split(":");
+  return {
+    name: parts[0] ?? null,
+    progress: parts[1] ? parseFloat(parts[1]) : null,
+  };
 }
