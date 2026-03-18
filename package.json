@@ -1,10 +1,17 @@
 {
-  "name": "@remlab/game-rcon",
-  "version": "0.0.0",
-  "private": true,
+  "name": "@kero-lab/game-rcon",
+  "version": "0.1.0",
+  "description": "Factorio RCON client for live game server stats",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kero-lab/game-rcon.git"
   },
   "dependencies": {
     "rcon-client": "^4.2.5"
