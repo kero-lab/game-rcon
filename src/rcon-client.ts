@@ -11,7 +11,7 @@
  */
 
 import { Rcon } from "rcon-client";
-import type { RconConnectionOptions } from "./types.js";
+import type { RconConnectionOptions } from "./types";
 
 /** Active connections keyed by "host:port" */
 const connectionPool = new Map<string, GameRconClient>();

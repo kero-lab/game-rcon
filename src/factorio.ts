@@ -12,14 +12,14 @@
  * @remlab/game-rcon — Part of Game Server Ecosystem (#406), Issue #489
  */
 
-import { GameRconClient } from "./rcon-client.js";
+import { GameRconClient } from "./rcon-client";
 import type {
   FactorioRconOptions,
   FactorioStats,
   FactorioExtendedStats,
   FactorioProductionRate,
   FactorioResearchStatus,
-} from "./types.js";
+} from "./types";
 
 const DEFAULT_CACHE_TTL = 45_000; // 45 seconds
 

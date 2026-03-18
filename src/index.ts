@@ -7,8 +7,8 @@
  * Part of Game Server Ecosystem (#406)
  */
 
-export { GameRconClient } from "./rcon-client.js";
-export { FactorioRcon } from "./factorio.js";
+export { GameRconClient } from "./rcon-client";
+export { FactorioRcon } from "./factorio";
 export type {
   RconConnectionOptions,
   FactorioRconOptions,
@@ -16,4 +16,4 @@ export type {
   FactorioExtendedStats,
   FactorioProductionRate,
   FactorioResearchStatus,
-} from "./types.js";
+} from "./types";
